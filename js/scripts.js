@@ -1,76 +1,127 @@
+let scene, renderer, camera, clock, width, height, video;
+let particles, videoWidth, videoHeight, imageCache;
+
 const canvas = document.createElement("canvas");
 const ctx = canvas.getContext("2d");
 
-let scene;
-let renderer;
-let camera;
-let particles;
-let clock;
-let width;
-let height;
-let video;
-let videoWidth;
-let videoHeight;
-let imageCache;
+const classNameForLoading = "loading";
 
-const videoOptions = {
-    video: true,
-    audio: false
+// audio
+let audio, analyser;
+const fftSize = 2048;  // https://developer.mozilla.org/en-US/docs/Web/API/AnalyserNode/fftSize
+const frequencyRange = {
+    bass: [20, 140],
+    lowMid: [140, 400],
+    mid: [400, 2600],
+    highMid: [2600, 5200],
+    treble: [5200, 14000],
 };
 
 const init = () => {
-    
-    //setup the scene for three js
+    document.body.classList.add(classNameForLoading);
+
     scene = new THREE.Scene();
     scene.background = new THREE.Color(0x111111);
 
-    //setup the renderer
     renderer = new THREE.WebGLRenderer();
-
-    //add the three js created canvas to the body
-    document.querySelector("body").appendChild(renderer.domElement);
+    document.getElementById("content").appendChild(renderer.domElement);
 
     clock = new THREE.Clock();
 
-    //Create the three js camera
+    initCamera();
+
+    onResize();
+
+    navigator.mediaDevices = navigator.mediaDevices || ((navigator.mozGetUserMedia || navigator.webkitGetUserMedia) ? {
+        getUserMedia: (c) => {
+            return new Promise(function (y, n) {
+                (navigator.mozGetUserMedia || navigator.webkitGetUserMedia).call(navigator, c, y, n);
+            });
+        }
+    } : null);
+
+    if (navigator.mediaDevices) {
+        initAudio();
+        initVideo();
+    } else {
+        showAlert();
+    }
+
+    draw();
+};
+
+const initCamera = () => {
     const fov = 45;
-    const aspect = width/height;
-    const near = 0.01;
-    const far = 10000;
+    const aspect = width / height;
 
-    camera = new THREE.PerspectiveCamera(fov, aspect, near, far);
-    
-    const z = Math.min(width, height);
-
+    camera = new THREE.PerspectiveCamera(fov, aspect, 0.1, 10000);
+    const z = Math.min(window.innerWidth, window.innerHeight);
     camera.position.set(0, 0, z);
     camera.lookAt(0, 0, 0);
 
     scene.add(camera);
+};
 
-    navigator.mediaDevices.getUserMedia(videoOptions, (stream) => {
-        video = document.querySelector("video");
-        video.srcObject = stream;
-        video.addEventListener("loadeddata", () => {
-            videoWidth = video.videoWidth;
-            videoHeight = video.videoWidth;
+const initVideo = () => {
+    video = document.getElementById("video");
+    video.autoplay = true;
 
-            createParticles();
+    const option = {
+        video: true,
+        audio: false
+    };
+    navigator.mediaDevices.getUserMedia(option)
+        .then((stream) => {
+            video.srcObject = stream;
+            video.addEventListener("loadeddata", () => {
+                videoWidth = video.videoWidth;
+                videoHeight = video.videoHeight;
+
+                createParticles();
+            });
+        })
+        .catch((error) => {
+            console.log(error);
+            showAlert();
         });
+};
+
+const initAudio = () => {
+    const audioListener = new THREE.AudioListener();
+    audio = new THREE.Audio(audioListener);
+
+    const audioLoader = new THREE.AudioLoader();
+    // https://www.newgrounds.com/audio/listen/232941
+    audioLoader.load('assets/DEATHTAKER_-_06_-_Skate_or_Waste.mp3', (buffer) => {
+        document.body.classList.remove(classNameForLoading);
+
+        audio.setBuffer(buffer);
+        audio.setLoop(true);
+        audio.setVolume(0.5);
+        audio.play();
     });
 
-    draw();
+    analyser = new THREE.AudioAnalyser(audio, fftSize);
 
-}
+    document.body.addEventListener('click', function () {
+        if (audio) {
+            if (audio.isPlaying) {
+                audio.pause();
+            } else {
+                audio.play();
+            }
+        }
+    });
+};
 
 const createParticles = () => {
     const imageData = getImageData(video);
     const geometry = new THREE.Geometry();
-
-    geometry.morphAttributes = {};
-
+    geometry.morphAttributes = {};  // This is necessary to avoid error.
     const material = new THREE.PointsMaterial({
-        size: 1,
-        color: 0xff3b6c
+        size: 2,
+        color: 0x8B0000,
+        sizeAttenuation: false
     });
 
     for (let y = 0, height = imageData.height; y < height; y += 1) {
@@ -86,41 +137,74 @@ const createParticles = () => {
 
     particles = new THREE.Points(geometry, material);
     scene.add(particles);
-}
+};
 
-const getImageData = (image) => {
+const getImageData = (image, useCache) => {
     if (useCache && imageCache) {
         return imageCache;
     }
 
-    const imageWidth = image.videoWidth;
-    const imageHeight = image.videoHeight;
+    const w = image.videoWidth;
+    const h = image.videoHeight;
 
-    canvas.width = imageWidth;
-    canvas.height = imageHeight;
+    canvas.width = w;
+    canvas.height = h;
 
-    //flip the image
-    ctx.translate(imageWidth, 0);
+    ctx.translate(w, 0);
     ctx.scale(-1, 1);
 
     ctx.drawImage(image, 0, 0);
-    imageCache = ctx.getImageData(0, 0, imageWidth, imageHeight);
-    return imageCache;
-}
+    imageCache = ctx.getImageData(0, 0, w, h);
 
-const draw = (t) =>{
+    return imageCache;
+};
+
+/**
+ * https://github.com/processing/p5.js-sound/blob/v0.14/lib/p5.sound.js#L1765
+ *
+ * @param data
+ * @param _frequencyRange
+ * @returns {number} 0.0 ~ 1.0
+ */
+const getFrequencyRangeValue = (data, _frequencyRange) => {
+    const nyquist = 48000 / 2;
+    const lowIndex = Math.round(_frequencyRange[0] / nyquist * data.length);
+    const highIndex = Math.round(_frequencyRange[1] / nyquist * data.length);
+    let total = 0;
+    let numFrequencies = 0;
+
+    for (let i = lowIndex; i <= highIndex; i++) {
+        total += data[i];
+        numFrequencies += 1;
+    }
+    return total / numFrequencies / 255;
+};
+
+const draw = (t) => {
     clock.getDelta();
     const time = clock.elapsedTime;
 
-    let r;
-    let g;
-    let b;
+    let r, g, b;
+
+    // audio
+    if (analyser) {
+        // analyser.getFrequencyData() would be an array with a size of half of fftSize.
+        const data = analyser.getFrequencyData();
+
+        const bass = getFrequencyRangeValue(data, frequencyRange.bass);
+        const mid = getFrequencyRangeValue(data, frequencyRange.mid);
+        const treble = getFrequencyRangeValue(data, frequencyRange.treble);
+
+        r = bass;
+        g = mid;
+        b = treble;
+    }
 
     // video
     if (particles) {
-        particles.material.color.r = 1 - r;
-        particles.material.color.g = 1 - g;
-        particles.material.color.b = 1 - b;
+       // particles.material.color.r = 1 - r;
+       // particles.material.color.g = 1 - g;
+       // particles.material.color.b = 1 - b;
 
         const density = 2;
         const useCache = parseInt(t) % 2 === 0;  // To reduce CPU usage.
@@ -152,8 +236,13 @@ const draw = (t) =>{
     }
 
     renderer.render(scene, camera);
+
     requestAnimationFrame(draw);
-}
+};
+
+const showAlert = () => {
+    document.getElementById("message").classList.remove("hidden");
+};
 
 const onResize = () => {
     width = window.innerWidth;
